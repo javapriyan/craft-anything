@@ -269,6 +269,8 @@ pub enum Done {
         backend: String,
         /// Why the pictures couldn't be copied, if they couldn't.
         pictures: Option<String>,
+        /// The folder already held a project: the request is its follow-up, not a new project's.
+        attached: bool,
     },
     /// A message's pictures were copied into its project (see `CraftApp::deliver`).
     Attached {
@@ -442,6 +444,8 @@ struct FirstFrames {
 }
 
 pub struct CraftApp {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) updates: updates::Updates,
     pub engine: Arc<Engine>,
     pub hub: Arc<AiHub>,
     pub state: UiState,
@@ -585,13 +589,21 @@ pub struct CraftApp {
 }
 
 impl CraftApp {
+    /// Show the last update's result once the native window begins drawing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn show_update_outcome_on_start(&mut self) {
+        self.updates.startup();
+    }
+
     /// Initialize UI state from the shared engine's saved settings, waiting rather than substituting defaults.
     pub fn new(engine: Arc<Engine>, hub: Arc<AiHub>) -> Self {
         // Wait for the engine if it's busy: defaults here would show Clean room and no AI, and the
         // next settings change would save them over the person's own.
         let settings = engine.session().settings.clone();
         i18n::set_language(&settings.language);
-        CraftApp {
+        let mut app = CraftApp {
+            #[cfg(not(target_arch = "wasm32"))]
+            updates: Default::default(),
             engine,
             hub,
             state: UiState::default(),
@@ -669,7 +681,13 @@ impl CraftApp {
             last_view: None,
             applied_theme: None,
             started: false,
+        };
+        // A config.toml that couldn't be read or set aside is said here, where the person is
+        // looking, and not only in the log: every save is refused until it's fixed.
+        if let Some(said) = settings_ui::not_loaded_warning(&app.settings) {
+            app.toast(said, true);
         }
+        app
     }
 
     /// Fonts and image loaders; call once with the egui context.
@@ -677,7 +695,10 @@ impl CraftApp {
         theme::install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
         // The zoom keys are ours (`shortcuts`), so zoom stays inside ZOOM_RANGE.
-        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        ctx.options_mut(|o| {
+            o.zoom_with_keyboard = false;
+            o.input_options.line_scroll_speed = theme::WHEEL_STEP;
+        });
     }
 
     /// Gives the macOS app its menu bar (nothing elsewhere). Call once the window is open.
@@ -786,6 +807,16 @@ impl CraftApp {
             self.state.toasts.remove(i);
             if i < self.toast_at.len() {
                 self.toast_at.remove(i);
+            }
+        }
+        // A confirmation takes the place of the one before it: two in a row (a switch flipped
+        // and flipped back) would only pile up over the screen.
+        if !error {
+            while let Some(i) = self.state.toasts.iter().position(|(_, e)| !e) {
+                self.state.toasts.remove(i);
+                if i < self.toast_at.len() {
+                    self.toast_at.remove(i);
+                }
             }
         }
         self.state.toasts.push((text, error));
@@ -1092,9 +1123,9 @@ impl CraftApp {
             ProblemKind::Broken => "Part of the app got stuck, so it was stopped and the rest carried on. Your work is kept.",
             _ => "Part of the app is stuck. Restarting clears it, and your work is kept.",
         };
-        egui::Panel::top("stuck-banner").frame(egui::Frame::new().fill(t.card).inner_margin(egui::Margin::symmetric(14, 8))).show(ui, |ui| {
+        egui::Panel::top("stuck-banner").frame(egui::Frame::new().fill(t.card).inner_margin(theme::pad::BAR)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                icons::show(ui, "triangle-alert", 16.0, t.danger);
+                icons::show(ui, "triangle-alert", crate::theme::icon::MD, t.danger);
                 ui.label(egui::RichText::new(i18n::tr(text)).color(t.text)).on_hover_text(problem.summary.clone());
                 if let Some(path) = &problem.log
                     && widgets::secondary(ui, None, "Open log").on_hover_text(path.display().to_string()).clicked()
@@ -1412,11 +1443,13 @@ impl CraftApp {
             chat::apply_event(&mut self.state.chat, e.clone());
             match e {
                 AgentEvent::ToolFinished { .. } => self.view_dirty = true,
-                AgentEvent::TurnDone { backend, input_tokens, output_tokens, cost_usd, cost_is_estimate } => {
+                AgentEvent::TurnDone { backend, input_tokens, output_tokens, tokens_unknown, cost_usd, cost_is_estimate } => {
                     self.view_dirty = true;
+                    self.session_usage.tokens_incomplete |= tokens_unknown;
                     self.session_usage.add_turn(input_tokens, output_tokens, cost_usd, cost_is_estimate);
                     let cost = cost_usd.map(|c| format!(", ${c:.4}")).unwrap_or_default();
-                    self.log(false, format!("{backend}: {input_tokens} in / {output_tokens} out{cost}"));
+                    let usage = if tokens_unknown { "token count unknown".into() } else { format!("{input_tokens} in / {output_tokens} out") };
+                    self.log(false, format!("{backend}: {usage}{cost}"));
                 }
                 AgentEvent::Error { message, .. } => self.log(true, message),
                 _ => {}
@@ -1538,7 +1571,7 @@ impl CraftApp {
             }
             Done::Facts(f) => self.facts_read(job, Some(f)),
             Done::PicturesAdded(added) => self.pictures_added(added),
-            Done::Created { ws, request, backend, pictures } => self.created(*ws, request, backend, pictures),
+            Done::Created { ws, request, backend, pictures, attached } => self.created(*ws, request, backend, pictures, attached),
             Done::Thumb { path, image } => self.thumb_ready(path, image),
             Done::Preview { path, image } => self.preview_ready(path, image),
             Done::Tool { tool, params, route, result } => self.tool_done(tool, params, route, result),
@@ -1909,6 +1942,18 @@ impl CraftApp {
     /// Draw the whole interface.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let safe = !self.jobs.busy()
+                && !self.runs.any_busy()
+                && !self.conversation.as_ref().is_some_and(|c| c.is_busy())
+                && !self.settings_dirty
+                && self.save_due.is_none()
+                && self.saving.is_none();
+            if self.updates.show(&ctx, safe) {
+                return;
+            }
+        }
         self.tick(&ctx);
         self.shortcuts(&ctx);
         #[cfg(target_os = "macos")]
@@ -1930,7 +1975,7 @@ impl CraftApp {
             egui::Panel::left("app-sidebar")
                 .exact_size(sidebar::width(self, &ctx))
                 .resizable(false)
-                .frame(egui::Frame::new().fill(t.chrome).inner_margin(egui::Margin::symmetric(8, 0)))
+                .frame(egui::Frame::new().fill(t.chrome).inner_margin(theme::pad::GUTTER))
                 .show(ui, |ui| guard_ui(ui, "sidebar", |ui| sidebar::show(self, ui)));
             egui::CentralPanel::default().frame(egui::Frame::new().fill(t.canvas)).show(ui, |ui| {
                 guard_ui(ui, "simple", |ui| match self.state.screen {
@@ -1947,6 +1992,7 @@ impl CraftApp {
         settings_ui::show(self, &ctx);
         home::modals(self, &ctx);
         self.toasts(&ctx);
+        widgets::text_focus_ring(&ctx);
         self.drop_overlay(&ctx);
         titlebar::window_edge(&ctx);
         titlebar::resize_edges(&ctx);
@@ -1975,33 +2021,62 @@ impl CraftApp {
             return;
         }
         let t = theme::Tokens::get(ctx);
-        let width = (ctx.content_rect().width() - 32.0).clamp(200.0, 640.0);
+        // Under the title bar, in the middle. Anywhere a message sits it is over something (at
+        // the bottom, the prompt box's switches just pressed; in a corner, a side panel; here, a
+        // screen's tabs), so the card lets clicks through to what is under it. Only its close
+        // button, drawn in a layer of its own, takes a click.
+        let width = (ctx.content_rect().width() - 2.0 * theme::space::LG).clamp(200.0, 420.0);
         let mut dismiss = None;
-        egui::Area::new(egui::Id::new("toasts")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0)).show(ctx, |ui| {
-            ui.set_width(width);
-            for (i, (text, error)) in self.state.toasts.iter().enumerate() {
-                egui::Frame::new()
-                    .fill(t.raised)
-                    .stroke(egui::Stroke::new(1.0, if *error { t.danger.gamma_multiply(0.6) } else { t.card_border }))
-                    .corner_radius(t.r_lg())
-                    .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: t.shadow })
-                    .inner_margin(egui::Margin::symmetric(14, 8))
-                    .show(ui, |ui| {
-                        ui.set_width(width - 28.0);
-                        ui.horizontal(|ui| {
-                            let (icon, col) = if *error { ("triangle-alert", t.danger) } else { ("check", t.success) };
-                            icons::show(ui, icon, 15.0, col);
-                            ui.add(egui::Label::new(egui::RichText::new(text).color(if *error { t.text } else { t.text_dim })).wrap());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if icons::button(ui, "x", 28.0, false, "Dismiss").clicked() {
-                                    dismiss = Some(i);
-                                }
+        // Where each card keeps room for its close button.
+        let mut close_at = Vec::with_capacity(self.state.toasts.len());
+        egui::Area::new(egui::Id::new("toasts"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, titlebar::HEIGHT + theme::space::SM))
+            .interactable(false)
+            .fade_in(true)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                ui.spacing_mut().item_spacing = egui::vec2(theme::space::SM, theme::space::XS);
+                // The mark and the close button are boxes of one size, and the words between
+                // them sit on that box's middle line: the same room on every side, however many
+                // lines the message takes.
+                let side = theme::ControlSize::Small.height();
+                let line = theme::leading(theme::SMALL);
+                let nudge = ((side - line) / 2.0).max(0.0);
+                let inner = width - 2.0 * theme::space::MD - 2.0;
+                for (i, (text, error)) in self.state.toasts.iter().enumerate() {
+                    egui::Frame::new()
+                        .fill(t.field)
+                        .stroke(egui::Stroke::new(1.0, t.card_border))
+                        .corner_radius(t.r_lg())
+                        .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: t.shadow })
+                        .inner_margin(theme::pad::PANEL)
+                        .show(ui, |ui| {
+                            ui.set_width(inner);
+                            ui.horizontal_top(|ui| {
+                                let (icon, col) = if *error { ("triangle-alert", t.danger) } else { ("check", t.success) };
+                                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+                                icons::paint(ui, mark, icon, theme::icon::MD, col);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.set_width(inner - 2.0 * (side + theme::space::SM));
+                                    ui.add_space(nudge);
+                                    ui.add(egui::Label::new(egui::RichText::new(text).size(theme::SMALL).line_height(Some(line)).color(t.text)).wrap());
+                                    ui.add_space(nudge);
+                                });
+                                let (slot, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+                                close_at.push((i, slot));
                             });
                         });
-                    });
-                ui.add_space(6.0);
-            }
-        });
+                }
+            });
+        for (i, slot) in close_at {
+            egui::Area::new(egui::Id::new(("toast-close", i))).order(egui::Order::Tooltip).fixed_pos(slot.min).show(ctx, |ui| {
+                if icons::button(ui, "x", theme::ControlSize::Small, false, "Dismiss").clicked() {
+                    dismiss = Some(i);
+                }
+            });
+        }
         if let Some(i) = dismiss {
             self.state.toasts.remove(i);
             if i < self.toast_at.len() {
@@ -2227,5 +2302,15 @@ pub fn kind_icon(k: TargetKind) -> &'static str {
         TargetKind::Evm => "zap",
         TargetKind::Sqlite => "database",
         TargetKind::Unknown => "file",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod updates;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CraftApp {
+    fn drop(&mut self) {
+        self.updates.finish();
     }
 }

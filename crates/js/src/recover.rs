@@ -8,7 +8,7 @@
 //! - `a(), b(), c();` statement sequences → separate statements (only in statement lists, and only
 //!   when no later part would change meaning at the start of a statement);
 //! - webpack module parameters `(e, t, n)` → `(module, exports, __webpack_require__)`, using scope
-//!   analysis so every reference is renamed and nothing is captured.
+//!   analysis so every reference is renamed and nothing is captured; skipped for possible direct eval.
 
 use crate::lex::{TokKind, tokenize};
 use crate::model::BundleModule;
@@ -171,6 +171,14 @@ fn rename_params(params: &[String], body: &str, targets: &[&str]) -> Option<(Str
         return None;
     }
     let sem = SemanticBuilder::new().with_build_nodes(true).build(&ret.program).semantic;
+    // Direct eval can read or create bindings by name, including from a nested function.
+    // Treat a call spelled `eval(...)` conservatively even when the name is locally bound.
+    if sem.nodes().iter().any(|node| {
+        matches!(node.kind(), AstKind::CallExpression(call)
+            if !call.optional && matches!(call.callee.get_inner_expression(), Expression::Identifier(id) if id.name == "eval"))
+    }) {
+        return None;
+    }
     let scoping = sem.scoping();
     let Some(Statement::ExpressionStatement(es)) = ret.program.body.first() else { return None };
     let Expression::FunctionExpression(f) = es.expression.get_inner_expression() else { return None };

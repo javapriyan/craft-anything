@@ -859,6 +859,33 @@ fn a_question_about_the_build_is_answered_without_building() {
     assert!(!h.state().runs.is_busy(&root));
 }
 
+/// #1695: a project built by an agent that isn't asked questions (Codex) says so before a question
+/// is sent, and the question stays in the box.
+#[test]
+fn a_question_the_builder_cannot_answer_is_refused_before_it_is_sent() {
+    use craft_anything_engine::workspace::{TargetRef, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    let mut ws = Workspace::create(d.path(), "Snake", "A snake game", TargetRef::None).unwrap();
+    ws.manifest.builder = Some("Codex".into());
+    let root = ws.root.clone();
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        a.backends =
+            vec![BackendConfig { name: "Codex".into(), kind: BackendKind::AgentCli, model: "codex".into(), base_url: None, ssh_host: None, enabled: true }];
+        a.workspace = Some(ws);
+        a.state.screen = Screen::Project;
+        a
+    });
+    h.run_steps(2);
+    h.state_mut().state.project_input = "/btw where are the latest files".into();
+    h.run_steps(1);
+    h.get_by_label("Send (Enter)").click();
+    h.run_steps(2);
+    assert!(h.state().state.toasts.iter().any(|(t, err)| *err && t.starts_with("Codex can't be kept to only reading")), "{:?}", h.state().state.toasts);
+    assert_eq!(h.state().state.project_input, "/btw where are the latest files", "it stays in the box");
+    assert!(h.state().asked.get(&root).is_none_or(Vec::is_empty), "nothing was asked");
+}
+
 #[test]
 fn a_long_answer_scrolls_with_the_conversation_and_comes_back_after_a_restart() {
     use craft_anything_engine::questions::{self, AskedQuestion};
@@ -1376,6 +1403,37 @@ fn a_model_the_list_doesnt_offer_can_be_typed_in() {
     assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Box" && b.model == "my-own-model")));
 }
 
+#[test]
+fn an_api_backends_request_rate_is_set_in_settings() {
+    let mut h = harness(|| {
+        let mut app = demo::app(demo::engine(Mode::Experienced, true));
+        app.hub
+            .add_backend(
+                BackendConfig {
+                    name: "Local model".into(),
+                    kind: BackendKind::OpenaiCompatible,
+                    model: "test".into(),
+                    base_url: None,
+                    ssh_host: None,
+                    enabled: true,
+                },
+                None,
+            )
+            .unwrap();
+        app.state.settings_open = true;
+        app.state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+        app
+    });
+    h.state_mut().refresh_backends();
+    assert!(wait(&mut h, |app| app.backends.iter().any(|backend| backend.name == "Local model")));
+    h.get_by_label("Requests per minute").focus();
+    h.run_steps(2);
+    h.get_by_label("Requests per minute").type_text("120");
+    h.run_steps(2);
+    h.get_by_label("Apply").click();
+    assert!(wait(&mut h, |app| app.backend_options.get("Local model").and_then(|options| options.requests_per_minute) == Some(120)));
+}
+
 /// #54, #98: an AI server on another computer is added by its address in Settings → AI, with a
 /// model that can chat, and the form empties once it's added.
 #[test]
@@ -1490,6 +1548,42 @@ fn a_claude_ais_effort_is_set_in_settings() {
     h.get_by_value("max");
 }
 
+/// #1813: an OpenAI-compatible AI has an effort setting too, showing "default" (nothing sent)
+/// until a level is chosen, and back again.
+#[test]
+fn an_openai_compatible_ais_effort_is_set_in_settings() {
+    use craft_anything_ai::{BackendConfig, BackendKind, Effort};
+    let mut h = harness(|| {
+        let a = demo::app(demo::engine(Mode::Experienced, true));
+        let cfg = BackendConfig {
+            name: "Box".into(),
+            kind: BackendKind::OpenaiCompatible,
+            model: "m".into(),
+            base_url: Some("http://127.0.0.1:0/v1".into()),
+            ssh_host: None,
+            enabled: true,
+        };
+        a.hub.add_backend(cfg, None).unwrap();
+        a
+    });
+    h.state_mut().refresh_backends();
+    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Box")));
+    h.state_mut().state.settings_open = true;
+    h.state_mut().state.settings_tab = craft_anything_ui_egui::state::SettingsTab::Ai;
+    h.run_steps(2);
+    h.get_by_label("Effort:");
+    h.get_by_value("default").click();
+    h.run();
+    assert!(h.query_by_label("max").is_none(), "only OpenAI's levels");
+    h.get_by_label("xhigh").click();
+    assert!(wait(&mut h, |a| a.backend_options.get("Box").and_then(|o| o.effort) == Some(Effort::Xhigh)));
+    h.run_steps(2);
+    h.get_by_value("xhigh").click();
+    h.run();
+    h.get_by_label("default").click();
+    assert!(wait(&mut h, |a| a.backend_options.get("Box").and_then(|o| o.effort).is_none()));
+}
+
 /// The picker exposes only the chosen model's depths and clears an old depth when changing models.
 #[test]
 fn opencode_picker_offers_only_the_selected_models_thinking_depths() {
@@ -1578,16 +1672,26 @@ fn claude_codes_account_folder_is_set_in_settings() {
     assert!(h.state().folder_inputs.is_empty(), "nothing left being typed");
     // A relative folder is refused; the saved one stays.
     h.state_mut().set_agent_folder("Claude Code", Some("claude-work".into()));
-    h.run_steps(4);
+    // Refusing a folder is background work too: an unchanged value alone does not mean the
+    // refusal has finished. Do not overlap it with the next settings mutation.
+    assert!(wait(&mut h, |a| a.jobs.running().next().is_none()));
     assert_eq!(chosen(h.state()).as_deref(), Some("~/.claude-work"));
     // Emptied, it's the usual folder again.
     h.state_mut().set_agent_folder("Claude Code", Some(String::new()));
-    assert!(wait(&mut h, |a| chosen(a).is_none()));
+    assert!(wait(&mut h, |a| chosen(a).is_none() && a.jobs.running().next().is_none()));
     // Added already, so it's offered again under the next free name, on the coding agents' tab.
     h.state_mut().state.detect_tab = Some(craft_anything_ui_egui::detect_tabs::DetectTab::Harnesses);
     h.run_steps(2);
+    h.get_by_label("Add another").scroll_to_me();
+    h.run();
     h.get_by_label("Add another").click();
-    assert!(wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Claude Code 2" && b.model == "claude-code")));
+    assert!(
+        wait(&mut h, |a| a.backends.iter().any(|b| b.name == "Claude Code 2" && b.model == "claude-code")),
+        "backends: {:?}; jobs: {:?}; toasts: {:?}",
+        h.state().backends,
+        h.state().jobs.list.iter().map(|j| (&j.title, &j.outcome)).collect::<Vec<_>>(),
+        h.state().state.toasts
+    );
 }
 
 /// Zoom keys stop at 50% and 200%, Cmd/Ctrl 0 goes back to 100%, and a zoom saved outside the

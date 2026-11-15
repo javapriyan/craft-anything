@@ -95,13 +95,17 @@ pub fn check(root: &Path) -> bool {
         return false;
     };
     let mut catalogs = Vec::new();
+    // French and Japanese have folders too, but they are not in this completeness check.
     for code in ["zh-hans", "zh-hant", "ru", "ko", "cs", "de", "ka", "es", "it", "vi", "pt-br", "tr", "th", "et"] {
-        let path = source.join("i18n").join(format!("{code}.tsv"));
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            eprintln!("i18n: can't read {}", path.display());
-            return false;
+        let dir = source.join("i18n").join(code);
+        let keys = match catalog_keys_in(&dir) {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("i18n: {e}");
+                return false;
+            }
         };
-        catalogs.push((code, catalog_keys(&text)));
+        catalogs.push((code, keys));
     }
     let report = compare(&lookups.0.0, &awaiting, &catalogs);
     for line in &report.problems {
@@ -115,6 +119,38 @@ pub fn check(root: &Path) -> bool {
 
 /// The list of strings that may be missing from the catalogs for now, beside them in `i18n/`.
 const AWAITING: &str = "awaiting.txt";
+
+/// Keys of every `*.tsv` in a language folder, read as the app reads one catalog. File-name
+/// order matches the build. A key defined in two files is an error: the app's map would keep
+/// one and hide the other.
+fn catalog_keys_in(dir: &Path) -> Result<BTreeSet<String>, String> {
+    let mut paths = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("can't read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let path = entry.map_err(|e| format!("can't read {}: {e}", dir.display()))?.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "tsv") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!("can't read {}", dir.join("*.tsv").display()));
+    }
+    let mut first: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut keys = BTreeSet::new();
+    for path in &paths {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("catalog.tsv");
+        for key in catalog_keys(&text) {
+            if let Some(earlier) = first.get(&key) {
+                return Err(format!("{}: {key:?} is in {earlier} and {name}", dir.display()));
+            }
+            first.insert(key.clone(), name.to_string());
+            keys.insert(key);
+        }
+    }
+    Ok(keys)
+}
 
 /// A catalog's keys, read as the app reads them (`i18n::parse`): a key with an empty translation
 /// shows in English, so it isn't translated.
@@ -227,5 +263,20 @@ mod tests {
     fn the_committed_list_is_readable() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/ui-egui/src/i18n").join(AWAITING);
         assert!(std::fs::read_to_string(path).is_ok());
+    }
+
+    /// A language folder is several catalogs. A key in two of them fails; distinct keys combine.
+    #[test]
+    fn a_key_in_two_catalog_files_fails_and_the_rest_combine() {
+        let dir = std::env::temp_dir().join(format!("craft-i18n-catalogs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("de")).unwrap();
+        std::fs::write(dir.join("de/core.tsv"), "Open\tÖffnen\n").unwrap();
+        std::fs::write(dir.join("de/r5.2-note.tsv"), "Open\tAuf\nClose\tSchließen\n").unwrap();
+        let err = catalog_keys_in(&dir.join("de")).unwrap_err();
+        assert!(err.contains("\"Open\"") && err.contains("core.tsv") && err.contains("r5.2-note.tsv"), "{err}");
+        std::fs::write(dir.join("de/r5.2-note.tsv"), "# Open\tignored\nClose\tSchließen\nEmpty\t \n").unwrap();
+        assert_eq!(catalog_keys_in(&dir.join("de")).unwrap(), set(&["Open", "Close"]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

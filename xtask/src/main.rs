@@ -1,4 +1,5 @@
 //! `cargo xtask <layers | locks | status | i18n-coverage | tools [--check] | wasm | licenses | schemas [--check] | pending [--count] | secrets [--history] | ci | version [set X.Y.Z] | ico <out.ico> <png>...>`
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -497,5 +498,28 @@ mod tests {
         let status = readme.split("\n## Status").nth(1).unwrap();
         let status = status.split("\n**Responsible use.**").next().unwrap().replace("\n> ", " ");
         assert!(!status.contains("**Next:** the first public release"), "{status}");
+    }
+
+    /// `xtask` was the one member that didn't opt into the workspace lints, so the repo-wide
+    /// `unsafe` ban didn't cover the tooling and a future `unwrap` in it would go unnoticed.
+    #[test]
+    fn every_member_manifest_uses_the_workspace_lints() {
+        let root = workspace_root();
+        let mut manifests = vec![root.join("xtask/Cargo.toml")];
+        for group in ["crates", "apps"] {
+            for entry in std::fs::read_dir(root.join(group)).unwrap().flatten() {
+                let manifest = entry.path().join("Cargo.toml");
+                if manifest.is_file() {
+                    manifests.push(manifest);
+                }
+            }
+        }
+        assert!(manifests.len() > 10, "found the members: {manifests:?}");
+        let missing: Vec<String> = manifests
+            .iter()
+            .filter(|m| !std::fs::read_to_string(m).unwrap_or_default().contains("[lints]\nworkspace = true"))
+            .map(|m| m.strip_prefix(&root).unwrap_or(m).display().to_string())
+            .collect();
+        assert!(missing.is_empty(), "these members don't use [lints] workspace = true: {missing:?}");
     }
 }

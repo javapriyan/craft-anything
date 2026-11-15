@@ -101,12 +101,24 @@ fn mock(responses: Vec<(u16, &'static str, String)>) -> (String, Arc<Mutex<Vec<S
     let seen = Arc::new(Mutex::new(Vec::new()));
     let s2 = seen.clone();
     std::thread::spawn(move || {
-        for (status, ctype, reply) in responses {
+        let mut responses = responses.into_iter().peekable();
+        while let Some((next_status, next_type, _)) = responses.peek() {
+            let lists_next = *next_status == 200 && *next_type == "application/json";
             let Ok((stream, _)) = l.accept() else { return };
             let mut r = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             r.read_line(&mut line).unwrap();
             let path = line.split_whitespace().nth(1).unwrap_or_default().to_string();
+            // Scripted questions are model lists answered with a list. Any other question is a
+            // window probe (crate::window) the test didn't script: say nothing, as a server that
+            // doesn't report its window does, and keep the scripted answer for the request after.
+            if line.starts_with("GET ") && !(lists_next && path.ends_with("/models")) {
+                let mut w = stream;
+                write!(w, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                w.flush().unwrap();
+                continue;
+            }
+            let Some((status, ctype, reply)) = responses.next() else { return };
             let mut headers = Vec::new();
             let mut len = 0usize;
             loop {
@@ -404,7 +416,7 @@ fn opencode_selection_is_validated_saved_and_run_natively_with_our_mcp_server() 
     let seen = dir.path().join("arguments.txt");
     let quote = |p: &std::path::Path| ssh::shell_quote(&p.display().to_string());
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\napi) cat {};;\nrun) printf '%s\\n' \"$@\" > {}; cat \"$OPENCODE_CONFIG\" >> {}; printf 'done';;\n*) exit 8;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\napi) cat {};;\nrun) if [ \"$2\" = '--help' ]; then printf '%s\\n' '--format --standalone'; exit 0; fi; printf '%s\\n' \"$@\" > {}; cat \"$OPENCODE_CONFIG\" >> {}; printf 'done';;\n*) exit 8;;\nesac\n",
         quote(&catalogue),
         quote(&seen),
         quote(&seen)
@@ -667,6 +679,42 @@ fn a_claude_ais_effort_is_changed() {
     assert_eq!(effort(&h, "Codex"), None, "an agent that doesn't take Claude's levels");
     assert!(h.set_effort("Codex", Some(Effort::Max)).is_err());
     assert!(!h.set_effort("Nobody", Some(Effort::Low)).unwrap());
+}
+
+/// #1813: an OpenAI-style API is sent a reasoning level only once the person chooses one, and
+/// only one of OpenAI's levels; OpenRouter gets it in its own field.
+#[test]
+fn an_openai_style_ais_effort_is_sent_only_once_chosen() {
+    use crate::model::{Msg, Stop, TurnRequest};
+    let reply = || (200, "text/event-stream", chat_sse(&[json!({"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]})]));
+    for (kind, field) in [(BackendKind::OpenaiCompatible, "/reasoning_effort"), (BackendKind::Openrouter, "/reasoning/effort")] {
+        let (h, _d) = hub();
+        let (url, seen) = mock(vec![reply(), reply()]);
+        let config = BackendConfig { name: "Box".into(), kind, model: "m".into(), base_url: Some(url), ssh_host: None, enabled: true };
+        h.add_backend(config, Some("k".into())).unwrap();
+        let ask = |h: &AiHub| {
+            let mut slot = h.build_model(&h.entry("Box").unwrap()).unwrap();
+            let messages = [Msg::user_text("hi")];
+            let request = TurnRequest { system: "S", messages: &messages, tools: &[], effort: prompt::choose_effort(slot.effort), max_tokens: 100 };
+            slot.model.turn(&request, &mut |_| {}, &Stop::default()).unwrap();
+        };
+        let effort = |h: &AiHub| crate::effort_in_use(&h.entry("Box").unwrap().config, h.options().get("Box"));
+        assert_eq!(effort(&h), None, "nothing is sent until it's chosen");
+        ask(&h);
+        assert!(h.set_effort("Box", Some(Effort::Max)).is_err(), "max isn't one of OpenAI's levels");
+        assert!(h.set_effort("Box", Some(Effort::Minimal)).unwrap());
+        assert_eq!(effort(&h), Some(Effort::Minimal));
+        ask(&h);
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].body.get("reasoning_effort").is_none() && seen[0].body.get("reasoning").is_none(), "{}", seen[0].body);
+        assert_eq!(seen[1].body.pointer(field), Some(&json!("minimal")), "{}", seen[1].body);
+        drop(seen);
+        assert!(h.set_effort("Box", None).unwrap());
+        assert_eq!(effort(&h), None);
+    }
+    // Gemini is offered only the levels every Gemini model takes.
+    let gemini = BackendConfig { name: "G".into(), kind: BackendKind::Gemini, model: "gemini-2.5-pro".into(), base_url: None, ssh_host: None, enabled: true };
+    assert_eq!(crate::effort_levels(&gemini), [Effort::Minimal, Effort::Low, Effort::Medium, Effort::High]);
 }
 
 #[test]

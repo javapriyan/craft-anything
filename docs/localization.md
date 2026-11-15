@@ -15,7 +15,7 @@ matching accepts underscores, case differences and Unix encoding suffixes.
 ## German
 
 **Deutsch** (`de`) uses the informal "du". `de`, `de-DE`, `de-AT` and `de-CH` select it, as does the
-system language when it is German. `crates/ui-egui/src/i18n/de.tsv` has the same keys as the Chinese
+system language when it is German. `crates/ui-egui/src/i18n/de/core.tsv` has the same keys as the Chinese
 catalogs (a unit test compares them), written from the English source strings, not from the Chinese.
 It was drafted with an AI and not yet reviewed by a native speaker; corrections are welcome.
 Product and technology names, tool ids and shortcuts keep their spelling. The kind detection that reads
@@ -25,7 +25,7 @@ so a translated suggestion keeps its project kind.
 ## Estonian
 
 **Eesti** (`et`) is selected by `et` and `et-EE`, and by the system language when it is Estonian.
-`crates/ui-egui/src/i18n/et.tsv` has the same keys as the other catalogs, written from the English
+`crates/ui-egui/src/i18n/et/core.tsv` has the same keys as the other catalogs, written from the English
 source. It was drafted with an AI from the English source, so corrections from native speakers are
 welcome. Product and technology names, tool ids and shortcuts keep their spelling. The glossary:
 *Puhas ruum* (Clean room), *Sügav* (Deep), *Uuri / Ehita / Kontrolli / Valmis* (Study / Build / Check /
@@ -41,13 +41,13 @@ source or topic, not the thing to build, so *Tee sellest mängust veebileht* is 
 ## Georgian
 
 **ქართული** (`ka`) is selected by `ka` and `ka-GE`, and by the system language when it is Georgian.
-`crates/ui-egui/src/i18n/ka.tsv` has the same keys as the other catalogs. Written with Claude Code from the
+`crates/ui-egui/src/i18n/ka/core.tsv` has the same keys as the other catalogs. Written with Claude Code from the
 meaning of each English string; terminology and doubtful strings decided by a native Georgian speaker (@devius).
 Glyphs come from Noto Sans Georgian in craft-fonts, which the pinned craft-fonts already has; a test checks it.
 ## Italian
 
 **Italiano** (`it`) uses the informal "tu". `it` and `it-IT` select it, as does the system language when it is
-Italian. `crates/ui-egui/src/i18n/it.tsv` has the same keys as the other catalogs, written from the English
+Italian. `crates/ui-egui/src/i18n/it/core.tsv` has the same keys as the other catalogs, written from the English
 source strings. It was drafted with an AI and not yet reviewed by a native speaker; corrections are welcome.
 Product and technology names, tool ids and shortcuts keep their spelling. The kind detection that reads a
 request also knows *gioco* and *sito*, so a translated suggestion keeps its project kind. Clean room is
@@ -56,7 +56,7 @@ request also knows *gioco* and *sito*, so a translated suggestion keeps its proj
 ## Vietnamese
 
 **Tiếng Việt** (`vi`) addresses the person as *bạn*. `vi` and `vi-VN` select it, as does the system
-language when it is Vietnamese. `crates/ui-egui/src/i18n/vi.tsv` has the same keys as the other
+language when it is Vietnamese. `crates/ui-egui/src/i18n/vi/core.tsv` has the same keys as the other
 catalogs, written from the English source strings in NFC (precomposed) Unicode. It was drafted with
 an AI and not yet reviewed by a native speaker; corrections are welcome. Product, technology and
 engine names, tool ids and shortcuts keep their spelling. The glossary: *Phòng sạch* (Clean room),
@@ -85,11 +85,14 @@ Thai glyphs come from Noto Sans Thai in craft-fonts, which the script test in `t
 
 ## Scope and format
 
-`crates/ui-egui/src/i18n/cs.tsv`, `de.tsv`, `es.tsv`, `et.tsv`, `it.tsv`, `ka.tsv`, `ko.tsv`, `pt-br.tsv`, `ru.tsv`, `th.tsv`, `tr.tsv`, `vi.tsv`, `zh-hans.tsv` and
-`zh-hant.tsv` contain original
-translations under the repository's MIT OR Apache-2.0 licence. Each UTF-8 line
-has two columns: `English source<TAB>translation`. Comments begin with `#`;
-`\n` represents a newline. The language registry in `i18n.rs` embeds the catalogs.
+Each language except English is a folder of UTF-8 TSV files under
+`crates/ui-egui/src/i18n/<code>/`: `cs`, `de`, `es`, `et`, `fr`, `it`, `ja`, `ka`, `ko`,
+`pt-br`, `ru`, `th`, `tr`, `vi`, `zh-hans` and `zh-hant`. `core.tsv` in each folder holds the
+catalog. The files contain original translations under the repository's MIT OR Apache-2.0
+licence. Each line has two columns: `English source<TAB>translation`. Comments begin with `#`;
+`\n` represents a newline. `build.rs` combines every `*.tsv` in a folder, in file-name order,
+into the catalog the language registry in `i18n.rs` embeds. That order does not matter: a
+string is looked up in a map.
 
 The catalogs cover first run, new projects, project controls, Settings, the
 workbench, tool titles, tool groups, target descriptions, tooltips and
@@ -105,7 +108,7 @@ Keep placeholders such as `{name}` and `{n}` intact, along with command IDs,
 shortcuts, escapes and trailing `…`. Update every catalog (`cs`, `de`, `es`, `et`, `it`, `ka`, `ko`, `pt-br`, `ru`, `th`, `tr`, `vi`, `zh-hans`, `zh-hant`)
 when English source keys change; the tests require matching key sets. Common terms include 净室 / 淨室 (Clean room), 深度 (Deep),
 构建 / 建置 (Build), 证据 / 證據 (Evidence), and 项目 / 專案 (Project).
-The Korean catalog `ko.tsv` uses 클린룸 (Clean room), 심층 (Deep), 분석 / 만들기 / 검사 / 완성
+The Korean catalog `ko/core.tsv` uses 클린룸 (Clean room), 심층 (Deep), 분석 / 만들기 / 검사 / 완성
 (Study / Build / Check / Ready), 근거 (Evidence) and 프로젝트 (Project); short labels are nouns and
 sentences use the formal 합니다 style.
 
@@ -131,6 +134,25 @@ and *videojuego* for a game, and *sitio web* and *página web* for a website, so
 suggestion keeps its project kind. The bare word *web* is deliberately not a signal: *una aplicación
 web* is an app, not a website.
 
+## Adding a string
+
+Add a new TSV file in every language folder the key-set test covers, with the same file name,
+instead of appending to `core.tsv`. Name it for the change (`r5.4-context-budget.tsv` in
+`i18n/de/`, `i18n/cs/` and the rest). One `English source<TAB>translation` line per new string.
+Two pull requests then edit different files.
+
+A key defined in two files of one language fails the build and the catalog test, so a duplicate
+cannot hide behind the lookup map. Strings that stay in English while someone reviews a
+translation are listed in `awaiting.txt`, not in a catalog, until that translation lands (see
+below). French and Japanese use the same folders; they are not part of the key-set comparison.
+
+## Adding a language
+
+Create `crates/ui-egui/src/i18n/<code>/core.tsv` with the same keys as the other catalogs, and
+add one row to `LANGUAGES` in `crates/ui-egui/src/i18n.rs`. Add `<code>` to the list in `check`
+in `xtask/src/i18n_coverage.rs`, so `cargo xtask i18n-coverage` checks the new catalog.
+Preserve placeholders, then run the checks below.
+
 ## Validation
 
 Run:
@@ -142,8 +164,9 @@ cargo clippy -p craft-anything-ui-egui -p xtask --all-targets -- -D warnings
 cargo xtask i18n-coverage
 ```
 
-Catalog tests check duplicate and empty entries, matching key sets, placeholders
-and ellipses. The coverage command checks literal translation calls, common
+Catalog tests check empty entries, duplicate keys (including a key defined in two files of one
+language), matching key sets, placeholders and ellipses. The coverage command reads each
+language folder the same way and checks literal translation calls, common
 widget labels and registered engine tool titles and groups; it also runs in
 `cargo xtask ci`. It does not prove coverage of arbitrary runtime text or labels
 held in tables, so review those when adding or changing UI code.
@@ -153,8 +176,10 @@ translations in a PR of their own. List each new string in `crates/ui-egui/src/i
 (one per line, as in a catalog's first column). The coverage command lets the strings listed
 there be missing, and the app shows them in English until a catalog has them. The command fails
 once a listed string is in every catalog, or is no longer shown, so the translation PR takes it
-out of the list. The catalog tests require every catalog to have the same keys, so that PR adds
-each string to all of them at once. Only strings the command finds can be listed: a literal in
+out of the list. The catalog tests require every catalog in that comparison to have the same
+keys, so that PR adds each string to all of them at once, as a new file of the same name in
+each language folder rather than at the end of `core.tsv`. Only strings the command finds can be
+listed: a literal in
 `tr`, `trf` or a widget's label, not one passed through a constant (`tr(LABEL)`), which the
 command can't see and would report as not shown.
 
@@ -167,11 +192,13 @@ cargo run -p craft-anything-ui-egui --example snapshot -- --lang zh-hant --only 
 
 Chinese, Korean and Georgian glyphs use the existing craft-fonts fallback, which release and CI builds
 Spanish and Estonian are Latin script and need no extra glyphs. Chinese and Korean glyphs use the existing craft-fonts fallback, which release and CI builds
-Vietnamese needs craft-fonts too: the bundled DM Sans and egui's default fonts lack the letters with
+Vietnamese needs craft-fonts too: the bundled Figtree and egui's default fonts lack the letters with
 stacked marks (ạ, ả, ấ, ế, ơ, ư, ữ…), so a build without craft-fonts shows them as boxes. With
-craft-fonts, Noto Sans CJK SC supplies those letters (a different face from the DM Sans around them);
+craft-fonts, Noto Sans CJK SC supplies those letters (a different face from the Figtree around them);
 the script test in `theme.rs` checks every one of them. Chinese and Korean glyphs use the existing craft-fonts fallback, which release and CI builds
 already include. Local builds must set `CRAFT_FONTS_DIR` to a craft-fonts checkout
-before compiling to get the same glyph coverage. The catalogs add no font assets.
+before compiling to get the same glyph coverage; with `CRAFT_FONTS_REQUIRED=1` set as well, a
+build that would leave the fonts out (no `CRAFT_FONTS_DIR`, or a bad one) fails instead of
+quietly showing boxes. The catalogs add no font assets.
 Check each script, clipping, narrow windows and native file dialogs visually
 on each platform; catalog coverage alone does not verify layout or fonts.

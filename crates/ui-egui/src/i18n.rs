@@ -3,7 +3,10 @@
 //! time. A string with no translation is shown in English. Tool ids, the CLI and MCP never see
 //! translated text.
 //!
-//! Adding a language: put `xx.tsv` in `i18n/` and add one row to [`LANGUAGES`].
+//! Adding a language: create `i18n/<code>/core.tsv` and add one row to [`LANGUAGES`].
+//! Adding strings: add `i18n/<code>/<change>.tsv` (the same file name in every language folder)
+//! instead of appending to `core.tsv`. `build.rs` combines each folder, in file-name order.
+//! Order does not matter. A key defined in two files of one language fails the build.
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
@@ -18,24 +21,31 @@ pub struct LangInfo {
     pub source: &'static str,
 }
 
+/// The catalog `build.rs` wrote for `code` by combining `i18n/<code>/*.tsv`.
+macro_rules! catalog {
+    ($code:literal) => {
+        include_str!(concat!(env!("OUT_DIR"), "/i18n/", $code, ".tsv"))
+    };
+}
+
 pub static LANGUAGES: &[LangInfo] = &[
     LangInfo { code: "en", name: "English", source: "" },
-    LangInfo { code: "de", name: "Deutsch", source: include_str!("i18n/de.tsv") },
-    LangInfo { code: "ka", name: "ქართული", source: include_str!("i18n/ka.tsv") },
-    LangInfo { code: "fr", name: "Français", source: include_str!("fr.tsv") },
-    LangInfo { code: "it", name: "Italiano", source: include_str!("i18n/it.tsv") },
-    LangInfo { code: "ja", name: "日本語", source: include_str!("ja.tsv") },
-    LangInfo { code: "zh-hans", name: "简体中文", source: include_str!("i18n/zh-hans.tsv") },
-    LangInfo { code: "zh-hant", name: "繁體中文", source: include_str!("i18n/zh-hant.tsv") },
-    LangInfo { code: "ru", name: "Русский", source: include_str!("i18n/ru.tsv") },
-    LangInfo { code: "ko", name: "한국어", source: include_str!("i18n/ko.tsv") },
-    LangInfo { code: "cs", name: "Čeština", source: include_str!("i18n/cs.tsv") },
-    LangInfo { code: "es", name: "Español", source: include_str!("i18n/es.tsv") },
-    LangInfo { code: "vi", name: "Tiếng Việt", source: include_str!("i18n/vi.tsv") },
-    LangInfo { code: "pt-br", name: "Português (Brasil)", source: include_str!("i18n/pt-br.tsv") },
-    LangInfo { code: "tr", name: "Türkçe", source: include_str!("i18n/tr.tsv") },
-    LangInfo { code: "th", name: "ไทย", source: include_str!("i18n/th.tsv") },
-    LangInfo { code: "et", name: "Eesti", source: include_str!("i18n/et.tsv") },
+    LangInfo { code: "de", name: "Deutsch", source: catalog!("de") },
+    LangInfo { code: "ka", name: "ქართული", source: catalog!("ka") },
+    LangInfo { code: "fr", name: "Français", source: catalog!("fr") },
+    LangInfo { code: "it", name: "Italiano", source: catalog!("it") },
+    LangInfo { code: "ja", name: "日本語", source: catalog!("ja") },
+    LangInfo { code: "zh-hans", name: "简体中文", source: catalog!("zh-hans") },
+    LangInfo { code: "zh-hant", name: "繁體中文", source: catalog!("zh-hant") },
+    LangInfo { code: "ru", name: "Русский", source: catalog!("ru") },
+    LangInfo { code: "ko", name: "한국어", source: catalog!("ko") },
+    LangInfo { code: "cs", name: "Čeština", source: catalog!("cs") },
+    LangInfo { code: "es", name: "Español", source: catalog!("es") },
+    LangInfo { code: "vi", name: "Tiếng Việt", source: catalog!("vi") },
+    LangInfo { code: "pt-br", name: "Português (Brasil)", source: catalog!("pt-br") },
+    LangInfo { code: "tr", name: "Türkçe", source: catalog!("tr") },
+    LangInfo { code: "th", name: "ไทย", source: catalog!("th") },
+    LangInfo { code: "et", name: "Eesti", source: catalog!("et") },
 ];
 
 /// Match a locale to a registered UI language. An explicit script wins over the region.
@@ -224,5 +234,120 @@ mod tests {
                 assert_eq!(holes(k), holes(v), "{}: {k:?}", l.code);
             }
         }
+    }
+
+    /// Translations from several files of one language. `Err` names the key and both places
+    /// when a key is defined twice (two files, or twice in one). Comments and empty translations
+    /// are not entries, matching [`parse`].
+    fn merge_catalog_files(files: &[(&str, &str)]) -> Result<HashMap<String, String>, String> {
+        let mut seen: HashMap<String, (String, usize)> = HashMap::new();
+        let mut map = HashMap::new();
+        for (name, text) in files {
+            for (line_no, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('\t') else { continue };
+                if key.is_empty() || value.trim().is_empty() {
+                    continue;
+                }
+                let key = key.replace("\\n", "\n");
+                let line_no = line_no + 1;
+                if let Some((first, first_line)) = seen.get(&key) {
+                    return Err(format!("{key:?} is in {first}:{first_line} and {name}:{line_no}"));
+                }
+                seen.insert(key.clone(), ((*name).to_string(), line_no));
+                map.insert(key, value.trim_end().replace("\\n", "\n"));
+            }
+        }
+        Ok(map)
+    }
+
+    #[test]
+    fn a_key_defined_in_two_files_of_one_language_fails() {
+        let err = match merge_catalog_files(&[("core.tsv", "Open\tÖffnen\n"), ("r5.2-note.tsv", "Open\tAuf\nClose\tZu\n")]) {
+            Err(e) => e,
+            Ok(_) => panic!("a key in two files must fail"),
+        };
+        assert!(err.contains("\"Open\"") && err.contains("core.tsv:1") && err.contains("r5.2-note.tsv:1"), "{err}");
+        // The same translation twice is still two definitions.
+        let err = match merge_catalog_files(&[("core.tsv", "Open\tÖffnen\n"), ("extra.tsv", "Open\tÖffnen\n")]) {
+            Err(e) => e,
+            Ok(_) => panic!("an identical key in two files must fail"),
+        };
+        assert!(err.contains("core.tsv:1") && err.contains("extra.tsv:1"), "{err}");
+        let err = match merge_catalog_files(&[("core.tsv", "Open\tÖffnen\nOpen\tAuf\n")]) {
+            Err(e) => e,
+            Ok(_) => panic!("a key repeated in one file must fail"),
+        };
+        assert!(err.contains("core.tsv:1") && err.contains("core.tsv:2"), "{err}");
+        // A comment and an empty translation are not the key, so they do not collide with it.
+        let ok = match merge_catalog_files(&[("core.tsv", "Open\tÖffnen\n"), ("r5.2-note.tsv", "# Open\tignored\nEmpty\t \nClose\tZu\n")]) {
+            Ok(map) => map,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(ok.get("Open").map(String::as_str), Some("Öffnen"));
+        assert_eq!(ok.get("Close").map(String::as_str), Some("Zu"));
+        assert_eq!(ok.len(), 2);
+    }
+
+    /// The embedded catalog is exactly the language folder: same keys and translations, and no
+    /// key defined in two of its files. French and Japanese live in folders too; they are not
+    /// part of the cross-language key-set comparison above.
+    #[test]
+    fn each_language_folder_matches_the_embedded_catalog() {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(!src.join("fr.tsv").exists(), "fr.tsv belongs in i18n/fr/");
+        assert!(!src.join("ja.tsv").exists(), "ja.tsv belongs in i18n/ja/");
+        let i18n = src.join("i18n");
+        let listing = std::fs::read_dir(&i18n).unwrap_or_else(|e| panic!("{}: {e}", i18n.display()));
+        let mut folders = std::collections::BTreeSet::new();
+        for entry in listing {
+            let entry = entry.unwrap_or_else(|e| panic!("{e}"));
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                panic!("{} has a file name that is not UTF-8", path.display());
+            };
+            if path.extension().is_some_and(|ext| ext == "tsv") {
+                panic!("{name} sits next to the language folders; move it into a folder");
+            }
+            if path.is_dir() {
+                folders.insert(name.to_string());
+            }
+        }
+        for lang in LANGUAGES {
+            if lang.code == "en" {
+                assert!(lang.source.is_empty());
+                assert!(!folders.contains("en"));
+                continue;
+            }
+            assert!(folders.remove(lang.code), "missing folder i18n/{}", lang.code);
+            let dir = i18n.join(lang.code);
+            let mut paths = Vec::new();
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            for entry in entries {
+                let entry = entry.unwrap_or_else(|e| panic!("{e}"));
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "tsv") {
+                    paths.push(path);
+                }
+            }
+            paths.sort();
+            assert!(!paths.is_empty(), "{}: no catalogs", lang.code);
+            let mut texts = Vec::new();
+            for path in &paths {
+                let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("catalog.tsv").to_string();
+                texts.push((name, text));
+            }
+            let loaded: Vec<(&str, &str)> = texts.iter().map(|(name, text)| (name.as_str(), text.as_str())).collect();
+            let merged = match merge_catalog_files(&loaded) {
+                Ok(map) => map,
+                Err(e) => panic!("{}: {e}", lang.code),
+            };
+            assert_eq!(merged, parse(lang.source), "{}", lang.code);
+        }
+        assert!(folders.is_empty(), "language folder with no registry row: {folders:?}");
     }
 }

@@ -224,6 +224,12 @@ fn hashed_ranges<'a>(data: &'a [u8], h: &PeHeaders) -> Result<Vec<&'a [u8]>, Str
     if !ordered || header_end > cert_start {
         return Err("the certificate table overlaps the headers".into());
     }
+    // The section table is read up to 96 entries and up to the end of the file. A file that
+    // declares more would leave sections out of the hash, so it isn't hashed.
+    let declared = h.pe_offset.checked_add(6).and_then(|o| read_u16(data, o)).map_or(0, usize::from);
+    if declared > h.sections.len() {
+        return Err(format!("the file declares {declared} sections, but only {} were read", h.sections.len()));
+    }
     let part = |from: usize, to: usize| data.get(from..to).ok_or_else(|| "the file is too short for its headers".to_string());
     let mut ranges = vec![part(0, checksum)?, part(checksum + 4, entry)?, part(entry + 8, header_end)?];
     let mut sections: Vec<&crate::pe::PeSection> = h.sections.iter().filter(|s| s.raw_size > 0).collect();
@@ -261,6 +267,9 @@ fn read_signature(data: &[u8], h: &PeHeaders, payload: &[u8], table_ok: bool) ->
     let certificates: Vec<CertInfo> = sd.certificates.iter().filter_map(|c| der::certificate(c)).collect();
     let signer = sd.signer_cert().and_then(der::certificate);
     let mut notes = Vec::new();
+    if sd.non_minimal_length {
+        notes.push(der::NON_MINIMAL_LENGTH_NOTE.into());
+    }
     if signer_count > 1 {
         notes.push(format!("The block has {signer_count} signers; only the first was read."));
     }
@@ -310,7 +319,11 @@ fn read_signature(data: &[u8], h: &PeHeaders, payload: &[u8], table_ok: bool) ->
     {
         report.signature_check = check.signature_valid;
         report.chain = Some(check.chain);
-        report.notes.extend(check.notes);
+        for note in check.notes {
+            if !report.notes.contains(&note) {
+                report.notes.push(note);
+            }
+        }
     }
     report
 }

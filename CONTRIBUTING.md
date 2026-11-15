@@ -11,7 +11,9 @@ In short:
   `chore/` plus the roadmap id (`feature/r1.4-provider-key-ui`). PRs are squash-merged, so the
   title is the commit message: plain English, what changed for the person or developer.
 - **Where things go:** [docs/extending.md](docs/extending.md) (tools, target kinds, checks, coding
-  agents, engines, plugins).
+  agents, engines, plugins). A new UI string goes in its own file under
+  `crates/ui-egui/src/i18n/<language>/`, not at the end of `core.tsv`
+  ([localisation](docs/localization.md)).
 - **Never crash, safe Rust only, every external program through `craft_anything_platform::process`,
   no secrets or personal data anywhere.** Everything is our own work: no code, names or wording copied from other projects.
 

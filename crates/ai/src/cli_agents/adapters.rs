@@ -40,6 +40,9 @@ pub struct ArgsCx<'a> {
     /// A question about a build: only reading (none in Clean room), no tool server, and a fresh
     /// session or a fork that leaves the builder's session unchanged.
     pub question: bool,
+    /// Where the message was written, for an adapter that [reads it from a file](AgentAdapter::reads_message_file);
+    /// None over SSH, or when the file couldn't be written, and the message goes in argv.
+    pub message_file: Option<&'a Path>,
 }
 
 /// One way of driving an agent CLI.
@@ -150,12 +153,21 @@ pub trait AgentAdapter: Send + Sync {
     fn plain_fallback(&self) -> bool {
         true
     }
+    /// When the flag check fails and there's no plain fallback: the error and its fix, if this
+    /// agent can't work without those flags (else the run tries anyway).
+    fn missing_flags_error(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
     /// The CLI writes one JSON event per line (else its output is the answer text).
     fn streams_json(&self) -> bool {
         true
     }
     /// Events for one parsed JSON line.
     fn parse(&self, _p: &mut StreamParser, _v: &Value) -> Vec<AgentEvent> {
+        Vec::new()
+    }
+    /// Diagnostics that an agent reports outside its JSON stream.
+    fn parse_stderr(&self, _p: &mut StreamParser, _line: &str) -> Vec<AgentEvent> {
         Vec::new()
     }
     /// It can continue a saved session.
@@ -170,6 +182,12 @@ pub trait AgentAdapter: Send + Sync {
     /// The message goes in on stdin, not in argv: a long one passes Windows' command-line limit
     /// ("The filename or extension is too long", os error 206, #402).
     fn prompt_on_stdin(&self) -> bool {
+        false
+    }
+    /// The message (preamble first) goes in a file on this computer, named in
+    /// [`ArgsCx::message_file`], for an agent that reads one but not stdin: a long one passes
+    /// Windows' command-line limit too (#402).
+    fn reads_message_file(&self) -> bool {
         false
     }
     /// What goes in on stdin when [`prompt_on_stdin`](AgentAdapter::prompt_on_stdin) says so:
@@ -203,7 +221,7 @@ pub trait AgentAdapter: Send + Sync {
     }
     /// An environment variable that hands a local native run our tool server, for an agent that
     /// takes it from its environment rather than its arguments.
-    fn mcp_env(&self, _mcp: &McpCommand) -> Result<Option<(&'static str, String)>, ToolError> {
+    fn mcp_env(&self, _mcp: &McpCommand, _access: Access) -> Result<Option<(&'static str, String)>, ToolError> {
         Ok(None)
     }
     /// Whether what a build needs on a remote SSH host is there, checked before a build starts.
@@ -213,7 +231,7 @@ pub trait AgentAdapter: Send + Sync {
     }
     /// Prepare this run's tool server on a remote SSH host (a config file there), returning the
     /// environment variable to set on the remote command. Default: the agent can't carry one.
-    fn remote_tool_server(&self, _host: &str, _mcp: &McpCommand) -> Result<Option<(&'static str, String)>, ToolError> {
+    fn remote_tool_server(&self, _host: &str, _mcp: &McpCommand, _access: Access) -> Result<Option<(&'static str, String)>, ToolError> {
         Ok(None)
     }
     /// The file in which this computer keeps the agent's saved session `id`, so the project can
@@ -302,6 +320,11 @@ impl AgentAdapters {
     pub fn register(&mut self, adapter: Arc<dyn AgentAdapter>) {
         self.adapters.retain(|a| !a.ids().iter().any(|id| adapter.ids().contains(id)));
         self.adapters.push(adapter);
+    }
+
+    /// Every registered adapter, in the order they were registered.
+    pub fn all(&self) -> &[Arc<dyn AgentAdapter>] {
+        &self.adapters
     }
 
     /// The adapter for an agent id; one it doesn't know gets the plain adapter.
@@ -595,9 +618,33 @@ impl AgentAdapter for ClaudeCode {
     }
 
     fn signed_in(&self, program: &str) -> Option<bool> {
-        let out = self.process(program).args(["auth", "status", "--json"]).timeout(Duration::from_secs(15)).stdout_cap(64 * 1024).run().ok()?;
-        let v: Value = serde_json::from_str(out.stdout_text().trim()).ok()?;
-        v.get("loggedIn").and_then(Value::as_bool)
+        let out = match self.process(program).args(["auth", "status", "--json"]).timeout(Duration::from_secs(15)).stdout_cap(64 * 1024).run() {
+            Ok(out) => out,
+            Err(e) => {
+                log::debug!("claude auth status --json didn't run: {e}");
+                return None;
+            }
+        };
+        // The status is the first JSON object printed: a certificate warning or a banner before it
+        // isn't a reason to call the person signed out (#1830).
+        let text = out.stdout_text();
+        let Some(json) = first_json_object(&text) else {
+            log::debug!("claude auth status --json: exit {:?}, {} bytes on stdout, no JSON object in it", out.code, text.len());
+            return None;
+        };
+        let v: Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(e) => {
+                // The answer's wording, never its content: it names an account and a token mode.
+                log::debug!("claude auth status --json: exit {:?}, {} bytes on stdout, its JSON didn't parse: {e}", out.code, text.len());
+                return None;
+            }
+        };
+        let signed = v.get("loggedIn").and_then(Value::as_bool);
+        if signed != Some(true) {
+            log::debug!("claude auth status --json: exit {:?}, {} bytes on stdout, loggedIn: {signed:?}", out.code, text.len());
+        }
+        signed
     }
 
     /// The account its `.claude.json` names (`oauthAccount`), kept there while the sign-in itself
@@ -783,6 +830,36 @@ impl AgentAdapter for Codex {
         &["codex"]
     }
 
+    fn resumes(&self) -> bool {
+        true
+    }
+
+    fn check_native_options(&self, options: &BackendOptions, _cwd: Option<&Path>) -> Result<(), ToolError> {
+        if options.args.iter().any(|arg| arg == "--ephemeral") {
+            return Err(ToolError::invalid("Codex's --ephemeral option does not save conversations for later turns.")
+                .with_remediation("Remove --ephemeral from this backend's arguments so Craft Anything can resume the project's conversation."));
+        }
+        if options.args.iter().any(|arg| arg == "--worktree") {
+            return Err(ToolError::invalid("Codex's --worktree option cannot continue this project's saved conversation.").with_remediation(
+                "Remove --worktree from this backend's arguments. To work in a worktree, select its existing folder as the project folder.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_stderr(&self, p: &mut StreamParser, line: &str) -> Vec<AgentEvent> {
+        let diagnostic = line.trim().to_ascii_lowercase();
+        if p.session_missing || !diagnostic.starts_with("error:") || !diagnostic.contains("no rollout found for thread id ") {
+            return Vec::new();
+        }
+        p.session_missing = true;
+        vec![AgentEvent::Error {
+            message: "Codex's earlier conversation about this project isn't on this computer.".into(),
+            remediation: Some("Ask again: a new conversation starts from what the project already has.".into()),
+            log: None,
+        }]
+    }
+
     /// Ask the selected CLI, not its auth file or keychain; discard raw status output.
     fn signed_in(&self, program: &str) -> Option<bool> {
         let out = Process::new(program).args(["login", "status"]).timeout(Duration::from_secs(10)).stdout_cap(16 * 1024).run().ok()?;
@@ -841,6 +918,11 @@ impl AgentAdapter for Codex {
             v.extend(["-m".into(), m.clone()]);
         }
         v.extend(cx.options.args.iter().cloned());
+        // Exec-only flags (notably --sandbox) stay before the resume subcommand.
+        // The saved thread id is positional data, never another CLI option.
+        if let Some(id) = cx.resume {
+            v.extend(["resume".into(), "--".into(), id.into()]);
+        }
         // The message itself goes in on stdin (see `stdin_text`).
         v.push("-".into());
         v
@@ -932,7 +1014,7 @@ fn codex_login_status(success: bool, stdout: &str, stderr: &str) -> Option<bool>
 /// What a finished Codex tool call says. A failed call carries `"result": null` beside its
 /// `error`, which showed as "null" (#540), so null fields are skipped and an error's message is
 /// used as written. Codex's refusal to run one of our tools it can't ask about gets the way out.
-fn codex_tool_text(item: &Value, tool: &str, ours: bool) -> String {
+pub(crate) fn codex_tool_text(item: &Value, tool: &str, ours: bool) -> String {
     let field = |k: &str| item.get(k).filter(|v| !v.is_null());
     let error = field("error").map(|e| e.get("message").and_then(Value::as_str).map_or_else(|| e.to_string(), str::to_string));
     let text = match (field("result"), error) {
@@ -942,9 +1024,16 @@ fn codex_tool_text(item: &Value, tool: &str, ours: bool) -> String {
     };
     // Another MCP server's refusal isn't fixed by our setup: it keeps Codex's own words.
     if ours && text.contains(CODEX_NEEDS_APPROVAL) {
-        // The feed keeps 200 characters of a result, so the fix comes first and fits.
+        // The feed keeps 200 characters of a result, so the fix comes first and fits. Setup
+        // approves only the tools that ask the person themselves; any other is approved, or not,
+        // in the person's own Codex settings, and setup changes nothing for it (#1867).
+        if craft_anything_engine::AGENT_APP_PREAPPROVED_TOOLS.contains(&tool) {
+            return format!(
+                "Codex blocked {tool}: it can't ask for approval here. Fix: run `craft-anything-cli setup --client codex --yes`, then retry. See docs/codex.md."
+            );
+        }
         return format!(
-            "Codex blocked {tool}: it can't ask for approval here. Fix: run `craft-anything-cli setup --client codex --yes`, then retry. See docs/codex.md."
+            "Codex blocked {tool}: it can't ask for approval here. To allow it, set approval_mode = \"approve\" under [mcp_servers.craft-anything.tools.{tool}] in Codex's config.toml."
         );
     }
     text
@@ -1050,10 +1139,61 @@ pub(super) fn remote_cli_path(host: &str) -> Option<String> {
     absolute_path_line(&out.stdout_text())
 }
 
+/// The first JSON object in `text`, to its closing brace. A CLI can print a warning (a certificate
+/// notice on Windows, a banner) before its answer, and the answer is still the object (#1830).
+fn first_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let rest = text.get(start..)?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return rest.get(..i + c.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The first line of `text` when it is an absolute path; a shell function, alias or banner isn't.
 fn absolute_path_line(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
     line.starts_with('/').then(|| line.to_string())
+}
+
+#[cfg(test)]
+mod first_json_object_tests {
+    use super::first_json_object;
+
+    /// #1830: a warning printed before the status doesn't hide it, and braces inside text don't
+    /// end it early.
+    #[test]
+    fn the_first_json_object_is_taken_from_noisy_output() {
+        assert_eq!(first_json_object("{\"loggedIn\":true}"), Some("{\"loggedIn\":true}"));
+        let noisy = "(node:1) Warning: self-signed certificate\n{\n  \"loggedIn\": true,\n  \"note\": \"a } inside text\"\n}\n";
+        let json = first_json_object(noisy).expect("the object after the warning");
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("balanced at the right brace");
+        assert_eq!(parsed["loggedIn"], true);
+        assert_eq!(first_json_object("nothing here"), None);
+        assert_eq!(first_json_object("{\"unfinished\": "), None);
+    }
 }
 
 #[cfg(test)]
@@ -1082,12 +1222,14 @@ fn remote_check(host: &str, stop: Option<&CancelToken>) -> Result<(), ToolError>
 
 /// Map the remote failure onto the fix, reusing the ssh failure wording other remote runs use.
 pub(super) fn remote_failure(host: &str, out: &craft_anything_platform::Output) -> ToolError {
-    if let Some(failure) = crate::ssh::diagnose(host, "craft-anything-cli", crate::ssh::is_git_server(host), out.code, out.stderr_text().as_str()) {
+    if let Some(failure) = crate::ssh::diagnose(host, "craft-anything-cli", crate::ssh::is_git_server(host), out.code, out.stderr_end_text().as_str()) {
         return ToolError::new(ErrorCode::EngineMissing, format!("Craft Anything can't set up its tools on {host}: {}.", failure.what))
             .with_remediation(failure.fix);
     }
-    let stderr = out.stderr_text();
-    let snippet: String = stderr.trim().chars().take(200).collect();
+    let end = out.end_text();
+    let trimmed = end.trim();
+    let n = trimmed.chars().count();
+    let snippet: String = trimmed.chars().skip(n.saturating_sub(200)).collect();
     let exit = out.code.map_or_else(|| "it was stopped".to_string(), |code| format!("exit {code}"));
     ToolError::new(ErrorCode::EngineMissing, format!("Craft Anything couldn't set up its tools on {host}: ssh didn't come back as expected ({exit})."))
         .with_remediation(if snippet.is_empty() {

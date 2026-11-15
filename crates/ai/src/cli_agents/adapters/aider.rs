@@ -1,7 +1,8 @@
-//! Aider (`aider --message`).
+//! Aider (`aider --message-file`).
 //!
-//! Aider reads positional arguments as files to edit, so the message goes to `--message`. The
-//! plain adapter passed it as a file name and every run stopped at once (#72).
+//! Aider reads positional arguments as files to edit, so the message goes to `--message-file`
+//! (`--message` over SSH, where no file is written). The plain adapter passed it as a file name
+//! and every run stopped at once (#72); a brief in argv passed Windows' command-line limit (#402).
 //!
 //! A one-shot run still asks questions and can open pages before the model is reached: it offers
 //! to make a git repository and to add `.aider*` to `.gitignore`, checks for a new version, shows
@@ -67,6 +68,41 @@ const MODEL_SHORTCUTS: &[&str] = &[
 
 pub struct Aider;
 
+/// Saved extra arguments without a message in them: `--message`, `--msg` and `-m` as Aider's
+/// parser declares them, followed by the message or joined to it (`--msg=…`, `-m…`). argparse
+/// also takes `--ms` for `--msg`; every shorter `--mes…` is shared with `--message-file`, so
+/// Aider refuses it (checked against 0.86.2's options). Its short flags without a value, `-v` and
+/// `-h`, may come first in one group: `-vm task` is `-v -m task`.
+fn without_message(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if matches!(arg.as_str(), "--message" | "--msg" | "--ms") {
+            it.next();
+        } else if arg.starts_with("--message=") || arg.starts_with("--msg=") || arg.starts_with("--ms=") {
+            // Joined to its message: nothing of it is kept.
+        } else if let Some(group) = arg.strip_prefix('-').filter(|g| !g.starts_with('-')) {
+            let (flags, after) = group.split_at(group.len() - group.trim_start_matches(['v', 'h']).len());
+            // Python 3.10's argparse also reads `-v=m` as `-v -m` (3.11 on refuses it).
+            let rest = after.strip_prefix('=').filter(|_| flags.len() == 1).unwrap_or(after);
+            match rest.strip_prefix('m') {
+                Some(joined) => {
+                    if joined.is_empty() {
+                        it.next();
+                    }
+                    if !flags.is_empty() {
+                        kept.push(format!("-{flags}"));
+                    }
+                }
+                None => kept.push(arg.clone()),
+            }
+        } else {
+            kept.push(arg.clone());
+        }
+    }
+    kept
+}
+
 impl AgentAdapter for Aider {
     fn ids(&self) -> &'static [&'static str] {
         &["aider"]
@@ -81,17 +117,29 @@ impl AgentAdapter for Aider {
         if !cx.builder {
             a.push("--dry-run".into());
         }
-        a.extend(cx.options.args.iter().cloned());
+        match cx.message_file {
+            // Aider runs `--message` before it reads `--message-file`, so a saved one would
+            // replace the request.
+            Some(_) => a.extend(without_message(&cx.options.args)),
+            None => a.extend(cx.options.args.iter().cloned()),
+        }
         // Last, so a saved extra argument can't be mistaken for the message.
-        a.extend(["--message".into(), format!("{}{}", cx.preamble, cx.prompt)]);
+        match cx.message_file {
+            Some(file) => a.extend(["--message-file".into(), file.display().to_string()]),
+            None => a.extend(["--message".into(), format!("{}{}", cx.preamble, cx.prompt)]),
+        }
         a
+    }
+
+    fn reads_message_file(&self) -> bool {
+        true
     }
 
     /// The message flag and the two that keep a run from asking about git or the console. Aider's
     /// plain form reads the prompt as a file name, so a failed check keeps this adapter rather
     /// than falling back to the plain one (#72).
     fn required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
-        (&["--help"], &["--message", "--no-fancy-input", "--no-git"])
+        (&["--help"], &["--message-file", "--message", "--no-fancy-input", "--no-git"])
     }
 
     fn plain_fallback(&self) -> bool {
@@ -297,8 +345,66 @@ mod tests {
     use super::*;
 
     fn args(builder: bool, options: &BackendOptions) -> Vec<String> {
+        args_with(builder, options, None)
+    }
+
+    fn args_with(builder: bool, options: &BackendOptions, message_file: Option<&Path>) -> Vec<String> {
         let mcp = McpCommand { command: "craft-anything-cli".into(), args: vec!["mcp".into()], notes: None };
-        Aider.args(&ArgsCx { options, prompt: "make a game", preamble: "PRE ", mcp: &mcp, resume: None, builder, reads_checked: false, question: false })
+        Aider.args(&ArgsCx {
+            options,
+            prompt: "make a game",
+            preamble: "PRE ",
+            mcp: &mcp,
+            resume: None,
+            builder,
+            reads_checked: false,
+            question: false,
+            message_file,
+        })
+    }
+
+    #[test]
+    fn a_saved_message_cannot_replace_the_request_in_its_file() {
+        let saved = |args: &[&str]| BackendOptions { args: args.iter().map(|a| a.to_string()).collect(), ..Default::default() };
+        let file = Path::new("message.txt");
+        for kept in [
+            &["--architect", "--message", "old task"][..],
+            &["--msg=old task", "--architect"],
+            &["--ms", "old task", "--architect"],
+            &["--ms=old task", "--architect"],
+            &["-m", "old task", "--architect"],
+            &["-mold task", "--architect"],
+        ] {
+            let a = args_with(true, &saved(kept), Some(file));
+            assert!(!a.iter().any(|x| x.contains("old task") || x == "--message" || x == "-m"), "{kept:?}: {a:?}");
+            assert!(a.contains(&"--architect".to_string()), "other saved arguments stay: {a:?}");
+            assert_eq!(&a[a.len() - 2..], ["--message-file".to_string(), file.display().to_string()]);
+        }
+        // In a group after flags that take no value: the message goes, the flags stay.
+        // Python 3.10 also reads `-v=m` as `-v -m`.
+        for group in
+            [&["-vm", "old task", "--architect"][..], &["-vhmold task", "--architect"], &["-v=m", "old task", "--architect"], &["-v=mold task", "--architect"]]
+        {
+            let a = args_with(true, &saved(group), Some(file));
+            assert!(!a.iter().any(|x| x.contains("old task") || x.contains('m') && x.starts_with('-') && !x.starts_with("--")), "{group:?}: {a:?}");
+            assert!(a.contains(&"--architect".to_string()), "{a:?}");
+            assert!(a.iter().any(|x| x.starts_with("-v")), "the other flags stay: {a:?}");
+        }
+        // A short option that isn't the message, or takes a value of its own, is kept whole.
+        let a = args_with(true, &saved(&["-c", "my.yml", "-cm.yml", "-v"]), Some(file));
+        assert!(a.windows(4).any(|w| w == ["-c", "my.yml", "-cm.yml", "-v"]), "{a:?}");
+        // With the message in argv it comes last, so it already wins over a saved one.
+        let a = args(true, &saved(&["--message", "old task"]));
+        assert_eq!(&a[a.len() - 2..], ["--message", "PRE make a game"]);
+    }
+
+    #[test]
+    fn a_written_message_goes_in_by_its_file() {
+        let file = Path::new("message.txt");
+        let a = args_with(true, &BackendOptions::default(), Some(file));
+        assert_eq!(&a[a.len() - 2..], ["--message-file".to_string(), file.display().to_string()]);
+        assert!(!a.iter().any(|x| x == "--message" || x.contains("make a game")), "the message stays off the command line: {a:?}");
+        assert!(Aider.reads_message_file());
     }
 
     /// A check with no keys in the environment and no home folder, as on a fresh computer.
@@ -339,7 +445,7 @@ mod tests {
     #[test]
     fn aider_is_registered_and_never_run_plain() {
         assert!(AgentAdapters::built_in().for_agent("aider").ids().contains(&"aider"), "registered, not the plain adapter");
-        assert_eq!(Aider.required_flags(), (&["--help"][..], &["--message", "--no-fancy-input", "--no-git"][..]));
+        assert_eq!(Aider.required_flags(), (&["--help"][..], &["--message-file", "--message", "--no-fancy-input", "--no-git"][..]));
         assert!(!Aider.plain_fallback() && !Aider.streams_json());
     }
 

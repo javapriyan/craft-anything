@@ -577,6 +577,8 @@ pub struct ProjectUsage {
     pub work_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// At least one turn didn't report tokens. The counts only include reported usage.
+    pub tokens_incomplete: bool,
     /// Everything reported, in US dollars: what API keys were charged plus coding agents' own
     /// estimates at API prices.
     pub cost_usd: f64,
@@ -642,7 +644,7 @@ impl ProjectUsage {
     }
 
     pub fn used_anything(&self) -> bool {
-        self.tokens() > 0 || self.priced
+        self.tokens() > 0 || self.tokens_incomplete || self.priced
     }
 }
 
@@ -650,6 +652,12 @@ impl ProjectUsage {
 pub struct Workspace {
     pub root: PathBuf,
     pub manifest: Manifest,
+}
+
+/// The absolute form of a project path, for a child that changes into the project folder. An
+/// already-absolute path is kept; one that can't be made absolute is returned unchanged.
+pub fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// A folder-name slug: lower-case words joined by dashes, at most 40 characters.
